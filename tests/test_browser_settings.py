@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import json
 import sys
@@ -7,7 +6,6 @@ from typing import Any, cast
 
 import pytest
 
-import utils.browser as browser_module
 from utils.browser import (
 	_parse_linuxdo_oauth_payload,
 	decode_browser_storage_state,
@@ -160,7 +158,7 @@ async def test_launch_login_context_passes_storage_state_to_ephemeral_context(mo
 
 
 @pytest.mark.asyncio
-async def test_linuxdo_oauth_logs_out_before_processing_callback(monkeypatch):
+async def test_linuxdo_oauth_logs_out_before_processing_callback():
 	class FakeResponse:
 		url = 'https://agentrouter.org/api/oauth/linuxdo?code=code&state=state&mode=login'
 		status = 200
@@ -185,6 +183,7 @@ async def test_linuxdo_oauth_logs_out_before_processing_callback(monkeypatch):
 	class FakeContext:
 		def __init__(self):
 			self.listener = None
+			self.request = FakeRequest(self)
 
 		def on(self, event, listener):
 			assert event == 'response'
@@ -194,53 +193,53 @@ async def test_linuxdo_oauth_logs_out_before_processing_callback(monkeypatch):
 			assert event == 'response'
 			assert listener is self.listener
 
-	class FakePopup:
+	class FakeAPIResponse:
+		def __init__(self, payload):
+			self.payload = payload
+			self.ok = True
+			self.status = 200
+
+		async def json(self):
+			return self.payload
+
+	class FakeRequest:
 		def __init__(self, context):
 			self.context = context
 
-		async def wait_for_load_state(self, *args, **kwargs):
-			await self.context.listener(FakeResponse())
-
-	class PopupInfo:
-		def __init__(self, popup):
-			loop = asyncio.get_running_loop()
-			self.value = loop.create_future()
-			self.value.set_result(popup)
-
-	class PopupManager:
-		def __init__(self, popup):
-			self.info = PopupInfo(popup)
-
-		async def __aenter__(self):
-			return self.info
-
-		async def __aexit__(self, *args):
-			return None
+		async def get(self, url):
+			if url.endswith('/api/status'):
+				return FakeAPIResponse(
+					{'success': True, 'data': {'linuxdo_oauth': True, 'linuxdo_client_id': 'client-id'}}
+				)
+			if '/api/oauth/state?mode=login' in url:
+				return FakeAPIResponse({'success': True, 'data': 'oauth-state'})
+			raise AssertionError(f'unexpected request: {url}')
 
 	class FakePage:
 		def __init__(self):
 			self.context = FakeContext()
 			self.visited = []
-			self.popup = FakePopup(self.context)
 
 		async def goto(self, url, **kwargs):
 			self.visited.append(url)
+			if url.startswith('https://connect.linux.do/oauth2/authorize'):
+				listener = self.context.listener
+				assert listener is not None
+				await listener(FakeResponse())
+
+		async def wait_for_load_state(self, *args, **kwargs):
+			return None
 
 		def get_by_role(self, *args, **kwargs):
 			return FakeLocator()
 
-		def expect_popup(self, **kwargs):
-			return PopupManager(self.popup)
-
-	async def fake_navigate_login_page(page, login_url, timeout_ms, **kwargs):
-		page.visited.append(login_url)
-
-	monkeypatch.setattr(browser_module, 'navigate_login_page', fake_navigate_login_page)
 	page = FakePage()
 
 	profile, checked_in = await login_with_linuxdo_oauth(cast(Any, page), 'https://agentrouter.org/login', 1_000)
 
 	assert page.visited[0] == 'https://agentrouter.org/api/user/logout'
-	assert page.visited[1] == 'https://agentrouter.org/login'
+	assert page.visited[1].startswith('https://connect.linux.do/oauth2/authorize?')
+	assert 'client_id=client-id' in page.visited[1]
+	assert 'state=oauth-state' in page.visited[1]
 	assert profile['id'] == 123
 	assert checked_in is True
