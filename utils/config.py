@@ -98,7 +98,7 @@ class AppConfig:
 				name='agentrouter',
 				domain='https://agentrouter.org',
 				login_path='/login',
-				sign_in_path=None,  # 无需签到接口，查询用户信息时自动完成签到
+				sign_in_path=None,  # 无独立签到接口；需通过重新登录触发
 				user_info_path='/api/user/self',
 				api_user_key='new-api-user',
 				bypass_method='waf_cookies',
@@ -155,6 +155,7 @@ class AccountConfig:
 	name: str | None = None
 	email: str | None = None
 	password: str | None = None
+	auth_type: Literal['linuxdo_oauth'] | None = None
 
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
@@ -169,11 +170,15 @@ class AccountConfig:
 			name=name if name else None,
 			email=data.get('email'),
 			password=data.get('password'),
+			auth_type=data.get('auth_type'),
 		)
 
 	def has_login_credentials(self) -> bool:
 		"""是否配置了邮箱密码登录"""
 		return bool(self.email and self.password)
+
+	def uses_linuxdo_oauth(self) -> bool:
+		return self.auth_type == 'linuxdo_oauth'
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -205,19 +210,28 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
+			auth_type = account_dict.get('auth_type')
+			if auth_type not in (None, 'linuxdo_oauth'):
+				print(f'ERROR: Account {i + 1} has unsupported auth_type: {auth_type}')
+				return None
+			if auth_type == 'linuxdo_oauth' and account_dict.get('provider', 'anyrouter') != 'agentrouter':
+				print(f'ERROR: Account {i + 1} linuxdo_oauth is only supported for agentrouter')
+				return None
+
 			if 'api_user' not in account_dict:
 				has_login = account_dict.get('email') and account_dict.get('password')
-				if not has_login:
+				if not has_login and auth_type != 'linuxdo_oauth':
 					print(
-						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password login can omit it'
+						f'ERROR: Account {i + 1} missing required field (api_user) - '
+						'email+password and linuxdo_oauth can omit it'
 					)
 					return None
 
 			has_cookies = 'cookies' in account_dict and account_dict['cookies']
 			has_login = account_dict.get('email') and account_dict.get('password')
 
-			if not has_cookies and not has_login:
-				print(f'ERROR: Account {i + 1} must have either cookies or email+password')
+			if not has_cookies and not has_login and auth_type != 'linuxdo_oauth':
+				print(f'ERROR: Account {i + 1} must have cookies, email+password, or linuxdo_oauth')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:

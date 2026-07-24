@@ -21,11 +21,13 @@ from dotenv import load_dotenv
 
 from utils.browser import (
 	BrowserLoginResult,
+	decode_browser_storage_state,
 	has_session_cookie,
 	is_logged_in,
 	launch_login_context,
 	load_browser_login_settings,
 	login_with_email_form,
+	login_with_linuxdo_oauth,
 	navigate_login_page,
 	prepare_browser_page,
 	save_login_screenshot,
@@ -214,9 +216,12 @@ async def login_with_credentials(
 			return None
 
 		cookies = await context.cookies()
-		all_cookies = {
-			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
-		}
+		all_cookies: dict[str, str] = {}
+		for cookie in cookies:
+			name = cookie.get('name')
+			value = cookie.get('value')
+			if isinstance(name, str) and isinstance(value, str) and name and value:
+				all_cookies[name] = value
 		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
 
 		success_msg = f'[SUCCESS] {account_name}: Login successful, got {len(all_cookies)} cookies'
@@ -230,6 +235,87 @@ async def login_with_credentials(
 		print(f'[FAILED] {account_name}: Error during login: {e}')
 		if page is not None:
 			await save_login_screenshot(page, provider_name, account_name, 'login-error')
+		await context.close()
+		return None
+
+
+async def login_with_linuxdo(
+	account_name: str,
+	provider_config,
+	storage_state: dict,
+	existing_cookies: dict,
+) -> BrowserLoginResult | None:
+	"""使用已有 Linux.do 登录态退出并重新授权 AgentRouter。"""
+	print(f'[PROCESSING] {account_name}: Logging in through Linux.do OAuth...')
+	settings = load_browser_login_settings(account_name, 'agentrouter', persist_profile=False)
+	timeout_ms = settings.wait_timeout_ms
+
+	try:
+		context = await launch_login_context(
+			settings,
+			use_proxy=provider_config.use_proxy,
+			storage_state=storage_state,
+		)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return None
+
+	page = None
+	try:
+		if existing_cookies:
+			from urllib.parse import urlparse
+
+			host = urlparse(provider_config.domain).hostname
+			if host:
+				await context.add_cookies(
+					[
+						{
+							'name': name,
+							'value': value,
+							'domain': host,
+							'path': '/',
+							'secure': True,
+						}
+						for name, value in existing_cookies.items()
+						if name and value
+					]
+				)
+
+		page = await context.new_page()
+		await prepare_browser_page(page)
+		profile, checked_in = await login_with_linuxdo_oauth(
+			page,
+			f'{provider_config.domain}{provider_config.login_path}',
+			timeout_ms,
+		)
+		verified_profile = await verify_browser_login(page, f'{provider_config.domain}/console', timeout_ms)
+		if verified_profile:
+			profile = verified_profile
+
+		cookies = await context.cookies([provider_config.domain])
+		agentrouter_cookies: dict[str, str] = {}
+		for cookie in cookies:
+			name = cookie.get('name')
+			value = cookie.get('value')
+			if isinstance(name, str) and isinstance(value, str) and name and value:
+				agentrouter_cookies[name] = value
+		api_user = str(profile['id']) if profile.get('id') is not None else None
+		if not agentrouter_cookies or not api_user:
+			raise ValueError('AgentRouter session was not created by Linux.do authorization')
+
+		if checked_in is True:
+			print(f'[SUCCESS] {account_name}: Linux.do re-login completed and check-in reward was granted')
+		elif checked_in is False:
+			print(f'[SUCCESS] {account_name}: Linux.do re-login completed; no new reward was reported')
+		else:
+			print(f'[SUCCESS] {account_name}: Linux.do re-login completed')
+
+		await context.close()
+		return BrowserLoginResult(cookies=agentrouter_cookies, api_user=api_user, checked_in=checked_in)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Linux.do OAuth login failed: {e}')
+		if page is not None:
+			await save_login_screenshot(page, 'agentrouter', account_name, 'linuxdo-oauth-error')
 		await context.close()
 		return None
 
@@ -362,11 +448,32 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	# 邮箱密码优先
+	# 显式认证方式优先
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
-	if account.has_login_credentials():
+	check_in_completed = False
+	if account.uses_linuxdo_oauth():
+		storage_state_value = os.getenv('LINUXDO_STORAGE_STATE', '')
+		try:
+			storage_state = decode_browser_storage_state(storage_state_value)
+		except ValueError as e:
+			print(f'[FAILED] {account_name}: {e}')
+			return False, None, None
+
+		login_result = await login_with_linuxdo(
+			account_name,
+			provider_config,
+			storage_state,
+			parse_cookies(account.cookies),
+		)
+		if not login_result:
+			return False, None, None
+		all_cookies = login_result.cookies
+		resolved_api_user = login_result.api_user
+		auth_method = 'Linux.do OAuth'
+		check_in_completed = True
+	elif account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
 		assert account.email is not None and account.password is not None
 		login_result = await login_with_credentials(
@@ -380,6 +487,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			auth_method = 'email/password'
+			check_in_completed = account.provider == 'agentrouter'
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
 			return False, None, None
@@ -403,6 +511,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		provider_config,
 		api_user_override=resolved_api_user,
 		use_proxy=provider_config.use_proxy,
+		check_in_completed=check_in_completed,
 	)
 
 
@@ -414,6 +523,7 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	use_proxy: bool = False,
+	check_in_completed: bool = False,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
@@ -455,12 +565,21 @@ def run_check_in_requests(
 			elif user_info_before:
 				print(user_info_before.get('error', 'Unknown error'))
 
+			if check_in_completed:
+				return True, None, user_info_before
+
 			if provider_config.needs_manual_check_in():
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
 				return success, user_info_before, user_info_after
 
 			user_info_after = get_user_info(client, headers, user_info_url)
+			if provider_config.name == 'agentrouter':
+				print(
+					f'[FAILED] {account_name}: Session cookies cannot trigger AgentRouter login-based check-in; '
+					'use auth_type=linuxdo_oauth or email/password'
+				)
+				return False, user_info_before, user_info_after
 			if user_info_after and user_info_after.get('success'):
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
 				return True, user_info_before, user_info_after

@@ -85,12 +85,53 @@
 - `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
+- `auth_type` (可选)：AgentRouter 使用 Linux.do 授权登录时填写 `linuxdo_oauth`
 
 **默认值说明**：
 
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
 - `anyrouter` 与 `agentrouter` 配置已内置，无需填写
+
+### AgentRouter 使用 Linux.do OAuth 签到
+
+AgentRouter 的签到由重新登录触发。没有 AgentRouter 账号密码时，可以让 Action 使用一次性导出的
+Linux.do 浏览器登录态执行：退出 AgentRouter -> Linux.do 授权 -> OAuth 回调 -> 验证签到结果。
+
+1. 在本地安装依赖和 CloakBrowser：
+
+```bash
+uv sync --dev
+uv run python -m cloakbrowser install
+```
+
+2. 导出 Linux.do 登录态。脚本会打开浏览器；完成 Linux.do 登录后回到终端按 Enter：
+
+```bash
+uv run python scripts/export_linuxdo_state.py
+```
+
+导出文件为 `.linuxdo-storage-state.b64`，已加入 `.gitignore`。该文件等同于登录凭据，不要上传、提交或发送给他人。
+
+3. 将导出内容写入 `production` Environment Secret：
+
+```bash
+gh secret set LINUXDO_STORAGE_STATE --env production < .linuxdo-storage-state.b64
+```
+
+4. `ANYROUTER_ACCOUNTS` 使用以下配置，不需要 `email`、`password` 或 `api_user`：
+
+```json
+[
+  {
+    "name": "AgentRouter",
+    "provider": "agentrouter",
+    "auth_type": "linuxdo_oauth"
+  }
+]
+```
+
+AgentRouter 在 GitHub 托管 runner 上通常仍需要 `PROXY_SUBSCRIPTION_URL`。Linux.do 登录态过期、触发验证码或要求重新确认授权时，重新执行导出并更新 Secret。不要在公开或不受信任的 PR workflow 中注入该 Secret；调试截图也可能包含登录页面信息。
 
 如果使用 session cookies 登录，接下来获取 cookies 与 api_user 的值。
 
@@ -262,7 +303,7 @@
   - `sign_in_path: "/api/user/sign_in"`
 - `agentrouter`：
   - `bypass_method: "waf_cookies"`（需要获取 `acw_tc`）
-  - `sign_in_path: null`（查询用户信息时自动签到）
+  - `sign_in_path: null`（没有独立签到接口；使用 `linuxdo_oauth` 或邮箱密码重新登录触发签到）
   - `use_proxy: true`
 
 **重要提示**：

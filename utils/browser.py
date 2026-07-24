@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from utils.debug import debug_print, is_debug_enabled
 from utils.popups import dismiss_popups, setup_popup_guard
@@ -24,6 +26,18 @@ EMAIL_LOGIN_BUTTON_NAMES = (
 	re.compile(r'Email or Username', re.I),
 	re.compile(r'Sign in with Email', re.I),
 	re.compile(r'Sign in with Email or Username', re.I),
+)
+LINUXDO_LOGIN_BUTTON_NAMES = (
+	re.compile(r'Linux\s*DO', re.I),
+	re.compile(r'LinuxDO', re.I),
+)
+LINUXDO_CONSENT_BUTTON_NAMES = (
+	re.compile(r'^授权$'),
+	re.compile(r'^同意$'),
+	re.compile(r'^允许$'),
+	re.compile(r'Authorize', re.I),
+	re.compile(r'Allow', re.I),
+	re.compile(r'Continue', re.I),
 )
 EMAIL_LOGIN_ENTRY_SELECTORS = (
 	'.semi-card button:has(.semi-icon-mail):not(form.semi-form button)',
@@ -53,6 +67,7 @@ FORM_ACTION_TIMEOUT_MS = 15_000
 EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
 SESSION_WAIT_TIMEOUT_MS = 45_000
+LINUXDO_OAUTH_API_SUFFIX = '/api/oauth/linuxdo'
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -143,6 +158,7 @@ _OPEN_EMAIL_FORM_JS = """() => {
 class BrowserLoginResult:
 	cookies: dict[str, str]
 	api_user: str | None = None
+	checked_in: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -200,7 +216,32 @@ class _EphemeralBrowserContext:
 			await self._browser.close()
 
 
-async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False) -> BrowserContext:
+def decode_browser_storage_state(value: str) -> dict:
+	"""Decode a raw JSON or base64-encoded Playwright storage state."""
+	raw = value.strip()
+	if not raw:
+		raise ValueError('Linux.do storage state is empty')
+
+	try:
+		state = json.loads(raw)
+	except json.JSONDecodeError:
+		try:
+			state = json.loads(base64.b64decode(raw, validate=True).decode('utf-8'))
+		except Exception as exc:
+			raise ValueError('Linux.do storage state must be JSON or base64-encoded JSON') from exc
+
+	if not isinstance(state, dict) or not isinstance(state.get('cookies'), list):
+		raise ValueError('Linux.do storage state is missing the cookies list')
+	state.setdefault('origins', [])
+	return state
+
+
+async def launch_login_context(
+	settings: BrowserLoginSettings,
+	*,
+	use_proxy: bool = False,
+	storage_state: dict | None = None,
+) -> BrowserContext:
 	_ensure_binary_path(settings)
 
 	launch_kwargs: dict = {
@@ -222,17 +263,21 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 		print('[WARN] Provider requires proxy but CHECKIN_PROXY_URL is not set')
 
 	if settings.persist_profile:
+		if storage_state is not None:
+			raise ValueError('storage_state cannot be combined with a persistent browser profile')
 		from cloakbrowser import launch_persistent_context_async
 
 		settings.profile_dir.mkdir(parents=True, exist_ok=True)
-		return await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
+		return cast('BrowserContext', await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs))
 
 	from cloakbrowser import launch_async
 
 	context_kwargs = {'viewport': launch_kwargs.pop('viewport')}
+	if storage_state is not None:
+		context_kwargs['storage_state'] = storage_state
 	browser = await launch_async(**launch_kwargs)
 	context = await browser.new_context(**context_kwargs)
-	return _EphemeralBrowserContext(context, browser)
+	return cast('BrowserContext', _EphemeralBrowserContext(context, browser))
 
 
 def get_screenshot_dir() -> Path:
@@ -295,7 +340,11 @@ async def wait_for_site_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS
 		print(f'[INFO] Dismissed {closed} popup dialog(s)')
 
 
-async def _wait_for_optional_load_state(page: Page, state: str, timeout_ms: int) -> bool:
+async def _wait_for_optional_load_state(
+	page: Page,
+	state: Literal['domcontentloaded', 'load', 'networkidle'],
+	timeout_ms: int,
+) -> bool:
 	try:
 		await page.wait_for_load_state(state, timeout=timeout_ms)
 		return True
@@ -474,6 +523,94 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 		debug_print(f'[WARN] Login verification failed: current URL={page.url}')
 		print('[WARN] Login verification failed')
 	return None
+
+
+def _parse_linuxdo_oauth_payload(payload: object) -> tuple[dict, bool | None]:
+	if not isinstance(payload, dict) or payload.get('success') is not True:
+		message = payload.get('message', 'Linux.do authorization failed') if isinstance(payload, dict) else ''
+		raise ValueError(message or 'Linux.do authorization failed')
+
+	data = payload.get('data')
+	if not isinstance(data, dict) or not data.get('id'):
+		raise ValueError('Linux.do authorization returned no AgentRouter user')
+	checked_in = data.get('checked_in') if isinstance(data.get('checked_in'), bool) else None
+	return data, checked_in
+
+
+async def _click_linuxdo_consent(page: Page, callback_received: asyncio.Event) -> bool:
+	deadline = time.monotonic() + 15
+	while time.monotonic() < deadline and not callback_received.is_set():
+		for role in ('button', 'link'):
+			for pattern in LINUXDO_CONSENT_BUTTON_NAMES:
+				try:
+					control = page.get_by_role(role, name=pattern).first
+					if await control.is_visible() and await _click_locator(control):
+						return True
+				except Exception:  # nosec B112
+					continue
+		await asyncio.sleep(0.5)
+	return False
+
+
+async def login_with_linuxdo_oauth(page: Page, login_url: str, timeout_ms: int) -> tuple[dict, bool | None]:
+	"""Log out of AgentRouter and complete its Linux.do OAuth callback."""
+	from urllib.parse import urlparse
+
+	parsed = urlparse(login_url)
+	base_url = f'{parsed.scheme}://{parsed.netloc}'
+	callback_payload: object | None = None
+	callback_received = asyncio.Event()
+
+	async def on_response(response) -> None:
+		nonlocal callback_payload
+		if LINUXDO_OAUTH_API_SUFFIX not in response.url or response.status != 200:
+			return
+		try:
+			callback_payload = await response.json()
+		except Exception:  # nosec B110
+			return
+		callback_received.set()
+
+	page.context.on('response', on_response)
+	try:
+		print('[PROCESSING] AgentRouter: Logging out before Linux.do authorization...')
+		await page.goto(f'{base_url}/api/user/logout', wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
+		await navigate_login_page(page, login_url, timeout_ms, provider='agentrouter')
+
+		linuxdo_button = None
+		for pattern in LINUXDO_LOGIN_BUTTON_NAMES:
+			candidate = page.get_by_role('button', name=pattern).first
+			try:
+				if await candidate.is_visible():
+					linuxdo_button = candidate
+					break
+			except Exception:  # nosec B112
+				continue
+		if linuxdo_button is None:
+			raise TimeoutError('Cannot find the LinuxDO login button')
+
+		async with page.expect_popup(timeout=timeout_ms) as popup_info:
+			if not await _click_locator(linuxdo_button):
+				raise RuntimeError('Cannot open Linux.do authorization')
+		popup = await popup_info.value
+		try:
+			await popup.wait_for_load_state('domcontentloaded', timeout=min(timeout_ms, 60_000))
+		except Exception:  # nosec B110
+			pass
+
+		if not callback_received.is_set():
+			await _click_linuxdo_consent(popup, callback_received)
+
+		try:
+			await asyncio.wait_for(callback_received.wait(), timeout=timeout_ms / 1000)
+		except TimeoutError as exc:
+			raise TimeoutError(
+				'Linux.do authorization did not return to AgentRouter; refresh LINUXDO_STORAGE_STATE'
+			) from exc
+
+		return _parse_linuxdo_oauth_payload(callback_payload)
+	finally:
+		page.context.remove_listener('response', on_response)
 
 
 async def wait_for_waf_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS) -> None:
