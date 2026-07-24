@@ -68,6 +68,9 @@ EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
 SESSION_WAIT_TIMEOUT_MS = 45_000
 LINUXDO_OAUTH_API_SUFFIX = '/api/oauth/linuxdo'
+OAUTH_STATE_API_SUFFIX = '/api/oauth/state'
+STATUS_API_SUFFIX = '/api/status'
+LINUXDO_AUTHORIZE_URL = 'https://connect.linux.do/oauth2/authorize'
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -537,6 +540,36 @@ def _parse_linuxdo_oauth_payload(payload: object) -> tuple[dict, bool | None]:
 	return data, checked_in
 
 
+def _extract_response_data(payload: object, label: str) -> object:
+	if not isinstance(payload, dict) or payload.get('success') is not True:
+		message = payload.get('message', '') if isinstance(payload, dict) else ''
+		raise ValueError(message or f'AgentRouter returned no {label}')
+	data = payload.get('data')
+	if data is None:
+		raise ValueError(f'AgentRouter returned no {label}')
+	return data
+
+
+async def _get_agentrouter_oauth_settings(page: Page, base_url: str) -> tuple[str, str]:
+	status_response = await page.context.request.get(f'{base_url}{STATUS_API_SUFFIX}')
+	if not status_response.ok:
+		raise ValueError(f'AgentRouter status request failed: HTTP {status_response.status}')
+	status_data = _extract_response_data(await status_response.json(), 'status data')
+	if not isinstance(status_data, dict) or status_data.get('linuxdo_oauth') is not True:
+		raise ValueError('AgentRouter Linux.do OAuth is not enabled')
+	client_id = status_data.get('linuxdo_client_id')
+	if not isinstance(client_id, str) or not client_id:
+		raise ValueError('AgentRouter returned no Linux.do client ID')
+
+	state_response = await page.context.request.get(f'{base_url}{OAUTH_STATE_API_SUFFIX}?mode=login')
+	if not state_response.ok:
+		raise ValueError(f'AgentRouter OAuth state request failed: HTTP {state_response.status}')
+	state = _extract_response_data(await state_response.json(), 'OAuth state')
+	if not isinstance(state, str) or not state:
+		raise ValueError('AgentRouter returned an invalid OAuth state')
+	return client_id, state
+
+
 async def _click_linuxdo_consent(page: Page, callback_received: asyncio.Event) -> bool:
 	deadline = time.monotonic() + 15
 	while time.monotonic() < deadline and not callback_received.is_set():
@@ -554,7 +587,7 @@ async def _click_linuxdo_consent(page: Page, callback_received: asyncio.Event) -
 
 async def login_with_linuxdo_oauth(page: Page, login_url: str, timeout_ms: int) -> tuple[dict, bool | None]:
 	"""Log out of AgentRouter and complete its Linux.do OAuth callback."""
-	from urllib.parse import urlparse
+	from urllib.parse import urlencode, urlparse
 
 	parsed = urlparse(login_url)
 	base_url = f'{parsed.scheme}://{parsed.netloc}'
@@ -575,31 +608,19 @@ async def login_with_linuxdo_oauth(page: Page, login_url: str, timeout_ms: int) 
 	try:
 		print('[PROCESSING] AgentRouter: Logging out before Linux.do authorization...')
 		await page.goto(f'{base_url}/api/user/logout', wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
-		await navigate_login_page(page, login_url, timeout_ms, provider='agentrouter')
-
-		linuxdo_button = None
-		for pattern in LINUXDO_LOGIN_BUTTON_NAMES:
-			candidate = page.get_by_role('button', name=pattern).first
-			try:
-				if await candidate.is_visible():
-					linuxdo_button = candidate
-					break
-			except Exception:  # nosec B112
-				continue
-		if linuxdo_button is None:
-			raise TimeoutError('Cannot find the LinuxDO login button')
-
-		async with page.expect_popup(timeout=timeout_ms) as popup_info:
-			if not await _click_locator(linuxdo_button):
-				raise RuntimeError('Cannot open Linux.do authorization')
-		popup = await popup_info.value
+		client_id, state = await _get_agentrouter_oauth_settings(page, base_url)
+		authorize_url = (
+			f'{LINUXDO_AUTHORIZE_URL}?{urlencode({"response_type": "code", "client_id": client_id, "state": state})}'
+		)
+		print('[PROCESSING] AgentRouter: Opening Linux.do authorization directly...')
+		await page.goto(authorize_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
 		try:
-			await popup.wait_for_load_state('domcontentloaded', timeout=min(timeout_ms, 60_000))
+			await page.wait_for_load_state('domcontentloaded', timeout=min(timeout_ms, 60_000))
 		except Exception:  # nosec B110
 			pass
 
 		if not callback_received.is_set():
-			await _click_linuxdo_consent(popup, callback_received)
+			await _click_linuxdo_consent(page, callback_received)
 
 		try:
 			await asyncio.wait_for(callback_received.wait(), timeout=timeout_ms / 1000)
