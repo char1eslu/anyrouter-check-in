@@ -1,9 +1,20 @@
+import asyncio
+import base64
+import json
 import sys
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
-from utils.browser import launch_login_context, load_browser_login_settings
+import utils.browser as browser_module
+from utils.browser import (
+	_parse_linuxdo_oauth_payload,
+	decode_browser_storage_state,
+	launch_login_context,
+	load_browser_login_settings,
+	login_with_linuxdo_oauth,
+)
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -43,7 +54,7 @@ async def test_launch_login_context_uses_persistent_context_when_enabled(monkeyp
 
 	result = await launch_login_context(settings)
 
-	assert result is context
+	assert cast(Any, result) is context
 	assert calls['profile_dir'] == str(settings.profile_dir)
 
 
@@ -95,6 +106,141 @@ async def test_launch_login_context_closes_browser_for_ephemeral_context(monkeyp
 	context = await launch_login_context(settings)
 	await context.close()
 
-	assert context.closed is True
+	assert cast(Any, context).closed is True
 	assert browser.closed is True
 	assert not settings.profile_dir.exists()
+
+
+def test_decode_browser_storage_state_accepts_base64_json():
+	state = {'cookies': [{'name': 'session', 'value': 'secret'}], 'origins': []}
+	encoded = base64.b64encode(json.dumps(state).encode()).decode()
+
+	assert decode_browser_storage_state(encoded) == state
+
+
+def test_parse_linuxdo_oauth_payload_returns_check_in_status():
+	profile, checked_in = _parse_linuxdo_oauth_payload(
+		{'success': True, 'data': {'id': 123, 'username': 'user', 'checked_in': True}}
+	)
+
+	assert profile['id'] == 123
+	assert checked_in is True
+
+
+@pytest.mark.asyncio
+async def test_launch_login_context_passes_storage_state_to_ephemeral_context(monkeypatch, tmp_path):
+	class FakeContext:
+		async def close(self):
+			return None
+
+	class FakeBrowser:
+		def __init__(self):
+			self.context_kwargs = {}
+
+		async def new_context(self, **kwargs):
+			self.context_kwargs = kwargs
+			return FakeContext()
+
+		async def close(self):
+			return None
+
+	browser = FakeBrowser()
+
+	async def fake_launch_async(**kwargs):
+		return browser
+
+	monkeypatch.setitem(sys.modules, 'cloakbrowser', SimpleNamespace(launch_async=fake_launch_async))
+	settings = load_browser_login_settings('Account 1', 'agentrouter', persist_profile=False)
+	state: dict[str, list[object]] = {'cookies': [], 'origins': []}
+
+	context = await launch_login_context(settings, storage_state=state)
+	await context.close()
+
+	assert browser.context_kwargs['storage_state'] == state
+
+
+@pytest.mark.asyncio
+async def test_linuxdo_oauth_logs_out_before_processing_callback(monkeypatch):
+	class FakeResponse:
+		url = 'https://agentrouter.org/api/oauth/linuxdo?code=code&state=state&mode=login'
+		status = 200
+
+		async def json(self):
+			return {'success': True, 'data': {'id': 123, 'checked_in': True}}
+
+	class FakeLocator:
+		async def is_visible(self):
+			return True
+
+		async def scroll_into_view_if_needed(self):
+			return None
+
+		async def click(self, **kwargs):
+			return None
+
+		@property
+		def first(self):
+			return self
+
+	class FakeContext:
+		def __init__(self):
+			self.listener = None
+
+		def on(self, event, listener):
+			assert event == 'response'
+			self.listener = listener
+
+		def remove_listener(self, event, listener):
+			assert event == 'response'
+			assert listener is self.listener
+
+	class FakePopup:
+		def __init__(self, context):
+			self.context = context
+
+		async def wait_for_load_state(self, *args, **kwargs):
+			await self.context.listener(FakeResponse())
+
+	class PopupInfo:
+		def __init__(self, popup):
+			loop = asyncio.get_running_loop()
+			self.value = loop.create_future()
+			self.value.set_result(popup)
+
+	class PopupManager:
+		def __init__(self, popup):
+			self.info = PopupInfo(popup)
+
+		async def __aenter__(self):
+			return self.info
+
+		async def __aexit__(self, *args):
+			return None
+
+	class FakePage:
+		def __init__(self):
+			self.context = FakeContext()
+			self.visited = []
+			self.popup = FakePopup(self.context)
+
+		async def goto(self, url, **kwargs):
+			self.visited.append(url)
+
+		def get_by_role(self, *args, **kwargs):
+			return FakeLocator()
+
+		def expect_popup(self, **kwargs):
+			return PopupManager(self.popup)
+
+	async def fake_navigate_login_page(page, login_url, timeout_ms, **kwargs):
+		page.visited.append(login_url)
+
+	monkeypatch.setattr(browser_module, 'navigate_login_page', fake_navigate_login_page)
+	page = FakePage()
+
+	profile, checked_in = await login_with_linuxdo_oauth(cast(Any, page), 'https://agentrouter.org/login', 1_000)
+
+	assert page.visited[0] == 'https://agentrouter.org/api/user/logout'
+	assert page.visited[1] == 'https://agentrouter.org/login'
+	assert profile['id'] == 123
+	assert checked_in is True
