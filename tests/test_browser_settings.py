@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import sys
@@ -7,12 +8,53 @@ from typing import Any, cast
 import pytest
 
 from utils.browser import (
+	_click_linuxdo_consent,
 	_parse_linuxdo_oauth_payload,
 	decode_browser_storage_state,
 	launch_login_context,
 	load_browser_login_settings,
 	login_with_linuxdo_oauth,
 )
+
+
+@pytest.mark.asyncio
+async def test_linuxdo_consent_falls_back_to_exact_text():
+	class HiddenLocator:
+		@property
+		def first(self):
+			return self
+
+		async def is_visible(self):
+			return False
+
+	class TextLocator(HiddenLocator):
+		def __init__(self):
+			self.clicked = False
+
+		async def is_visible(self):
+			return True
+
+		async def scroll_into_view_if_needed(self):
+			return None
+
+		async def click(self, **kwargs):
+			self.clicked = True
+
+	class FakePage:
+		def __init__(self):
+			self.control = TextLocator()
+
+		def get_by_role(self, *args, **kwargs):
+			return HiddenLocator()
+
+		def get_by_text(self, text, **kwargs):
+			return self.control if text == '允许' else HiddenLocator()
+
+	page = FakePage()
+	clicked = await _click_linuxdo_consent(cast(Any, page), asyncio.Event())
+
+	assert clicked is True
+	assert page.control.clicked is True
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
