@@ -66,6 +66,7 @@ proxy-groups:
       - subscription
 
 rules:
+  - DOMAIN-SUFFIX,linux.do,DIRECT
   - MATCH,CHECKIN
 EOF
 
