@@ -571,7 +571,7 @@ async def _get_agentrouter_oauth_settings(page: Page, base_url: str) -> tuple[st
 
 
 async def _click_linuxdo_consent(page: Page, callback_received: asyncio.Event) -> bool:
-	deadline = time.monotonic() + 15
+	deadline = time.monotonic() + 30
 	while time.monotonic() < deadline and not callback_received.is_set():
 		for role in ('button', 'link'):
 			for pattern in LINUXDO_CONSENT_BUTTON_NAMES:
@@ -581,6 +581,13 @@ async def _click_linuxdo_consent(page: Page, callback_received: asyncio.Event) -
 						return True
 				except Exception:  # nosec B112
 					continue
+		for text in ('允许', '授权', '同意', 'Authorize', 'Allow', 'Continue'):
+			try:
+				control = page.get_by_text(text, exact=True).first
+				if await control.is_visible() and await _click_locator(control):
+					return True
+			except Exception:  # nosec B112
+				continue
 		await asyncio.sleep(0.5)
 	return False
 
