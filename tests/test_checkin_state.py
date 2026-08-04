@@ -4,7 +4,15 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from checkin import generate_balance_hash
+from checkin import generate_balance_hash, get_exit_code
+
+
+def test_exit_code_is_success_when_any_account_succeeds():
+	assert get_exit_code(1) == 0
+
+
+def test_exit_code_is_failure_when_all_accounts_fail():
+	assert get_exit_code(0) == 1
 
 
 def test_balance_hash_changes_when_quota_changes():

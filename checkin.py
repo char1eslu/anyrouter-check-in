@@ -74,6 +74,11 @@ def generate_balance_hash(balances):
 	return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
 
 
+def get_exit_code(success_count: int) -> int:
+	"""至少一个账号签到成功时，整个任务视为成功。"""
+	return 0 if success_count > 0 else 1
+
+
 def parse_cookies(cookies_data):
 	"""解析 cookies 数据"""
 	if isinstance(cookies_data, dict):
@@ -754,7 +759,7 @@ async def main():
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	sys.exit(0 if success_count == total_count else 1)
+	sys.exit(get_exit_code(success_count))
 
 
 def run_main():
