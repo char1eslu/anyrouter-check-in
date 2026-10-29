@@ -1,0 +1,30 @@
+name: Keepalive
+
+# GitHub 会在仓库连续 60 天无提交后自动停用所有 schedule 触发的工作流
+# （表现为 Actions 列表里显示 "This scheduled workflow is disabled because
+#  there has been no repository activity for more than 60 days"）。
+# 本工作流每月两次产生一次提交，用于重置该计时器，避免签到任务再次被停用。
+
+on:
+  schedule:
+    - cron: '0 3 1,15 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成提交以重置 60 天不活跃计时器
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p .github
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/last-keepalive
+          git add .github/last-keepalive
+          git commit -m "chore(keepalive): $(date -u +%Y-%m-%d)" || exit 0
+          git push
